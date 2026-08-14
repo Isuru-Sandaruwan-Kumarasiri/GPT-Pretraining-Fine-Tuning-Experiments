@@ -1,0 +1,304 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Commented out IPython magic to ensure Python compatibility.
+# %cd /content/drive/MyDrive/CSC4182-202425/Lab Session4
+
+!pip install -q transformers datasets accelerate peft trl bitsandbytes evaluate
+!pip install -q rouge_score bert_score
+
+
+import torch
+print("GPU available :", torch.cuda.is_available())
+print("GPU name      :", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None")
+print("VRAM          :", round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1), "GB")
+
+
+import pandas as pd, random, re
+random.seed(42)
+
+WC_PATH       = "/content/drive/MyDrive/CSC4182-202425/Lab Session4/WorldCupDS/WorldCups.csv"
+MATCHES_PATH  = "/content/drive/MyDrive/CSC4182-202425/Lab Session4/WorldCupDS/WorldCupMatches.csv"
+
+wc      = pd.read_csv(WC_PATH)
+matches = pd.read_csv(MATCHES_PATH)
+
+all_countries = sorted(set(wc["Winner"]) | set(wc["Country"]) | set(wc["Runners-Up"]))
+
+def wrong_country(true_country):
+    choices = [c for c in all_countries if c != true_country]
+    return random.choice(choices)
+
+def prompt_text(question: str) -> str:
+    # Same chat template as the SFT stage, truncated before the assistant turn
+    return (
+        f"<|system|>You are a FIFA World Cup expert assistant.</s>\n"
+        f"<|user|>{question.strip()}</s>\n"
+        f"<|assistant|>"
+    )
+
+def completion(answer: str) -> str:
+    return f"{answer.strip()}</s>"
+
+pref_records = []
+
+# 1. Winner / host questions — corrupt the country, keep everything else identical
+for _, r in wc.iterrows():
+    yr = int(r["Year"])
+
+    q = f"Who won the {yr} FIFA World Cup?"
+    chosen   = f"{r['Winner']} won the {yr} FIFA World Cup, which was hosted by {r['Country']}."
+    rejected = f"{wrong_country(r['Winner'])} won the {yr} FIFA World Cup, which was hosted by {r['Country']}."
+    pref_records.append({"prompt": prompt_text(q), "chosen": completion(chosen), "rejected": completion(rejected)})
+
+    q = f"Which country hosted the {yr} FIFA World Cup?"
+    chosen   = f"The {yr} FIFA World Cup was hosted by {r['Country']}."
+    rejected = f"The {yr} FIFA World Cup was hosted by {wrong_country(r['Country'])}."
+    pref_records.append({"prompt": prompt_text(q), "chosen": completion(chosen), "rejected": completion(rejected)})
+
+    q = f"Who was the runner-up at the {yr} FIFA World Cup?"
+    chosen   = f"The runner-up at the {yr} FIFA World Cup was {r['Runners-Up']}."
+    rejected = f"The runner-up at the {yr} FIFA World Cup was {wrong_country(r['Runners-Up'])}."
+    pref_records.append({"prompt": prompt_text(q), "chosen": completion(chosen), "rejected": completion(rejected)})
+
+# 2. Match-result questions — corrupt the scoreline
+matches_clean = matches.dropna(subset=["Home Team Name", "Away Team Name", "Home Team Goals", "Away Team Goals"])
+for _, r in matches_clean.sample(min(400, len(matches_clean)), random_state=42).iterrows():
+    home, away = str(r["Home Team Name"]).strip(), str(r["Away Team Name"]).strip()
+    hg, ag = int(r["Home Team Goals"]), int(r["Away Team Goals"])
+    yr, stage = int(r["Year"]), str(r["Stage"]).strip()
+
+    if hg > ag:   true_result = f"{home} beat {away} {hg}\u2013{ag}"
+    elif ag > hg: true_result = f"{away} beat {home} {ag}\u2013{hg}"
+    else:         true_result = f"{home} and {away} drew {hg}\u2013{ag}"
+
+    # corrupt: flip / inflate the scoreline so it's wrong but still plausible-looking
+    fake_hg, fake_ag = hg + random.choice([1, 2]), ag
+    if fake_hg > fake_ag:   fake_result = f"{home} beat {away} {fake_hg}\u2013{fake_ag}"
+    elif fake_ag > fake_hg: fake_result = f"{away} beat {home} {fake_ag}\u2013{fake_hg}"
+    else:                   fake_result = f"{home} and {away} drew {fake_hg}\u2013{fake_ag}"
+
+    q = f"What was the result of the {home} vs {away} match at the {yr} FIFA World Cup?"
+    chosen   = f"In the {stage} stage of the {yr} FIFA World Cup, {true_result}."
+    rejected = f"In the {stage} stage of the {yr} FIFA World Cup, {fake_result}."
+    pref_records.append({"prompt": prompt_text(q), "chosen": completion(chosen), "rejected": completion(rejected)})
+
+# 3. Style preference — same correct fact, but reject overly verbose/hedgy phrasing
+hedge_templates = [
+    "I think it might have been {ans}, but I'm not 100% certain.",
+    "As far as I can recall, possibly {ans}, though it could be wrong.",
+    "It's hard to say for sure, but I believe the answer is roughly {ans}.",
+]
+for _, r in wc.sample(min(40, len(wc)), random_state=7).iterrows():
+    yr = int(r["Year"])
+    q = f"Who won the {yr} FIFA World Cup?"
+    chosen   = f"{r['Winner']} won the {yr} FIFA World Cup, which was hosted by {r['Country']}."
+    hedge    = random.choice(hedge_templates).format(ans=f"{r['Winner']}")
+    pref_records.append({"prompt": prompt_text(q), "chosen": completion(chosen), "rejected": completion(hedge)})
+
+random.shuffle(pref_records)
+print(f"Total preference pairs generated: {len(pref_records)}")
+print("\n\u2500\u2500 Sample pair \u2500\u2500")
+print("PROMPT  :", pref_records[0]["prompt"])
+print("CHOSEN  :", pref_records[0]["chosen"])
+print("REJECTED:", pref_records[0]["rejected"])
+
+
+from datasets import Dataset
+
+n = len(pref_records)
+train_end = int(0.80 * n)
+val_end   = int(0.90 * n)
+
+dpo_train = Dataset.from_list(pref_records[:train_end])
+dpo_val   = Dataset.from_list(pref_records[train_end:val_end])
+dpo_test  = Dataset.from_list(pref_records[val_end:])
+
+print(f"Train : {len(dpo_train)}")
+print(f"Val   : {len(dpo_val)}")
+print(f"Test  : {len(dpo_test)}")
+
+
+import torch
+import os
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import PeftModel
+
+MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+SFT_ADAPTER_PATH = "/content/drive/MyDrive/CSC4182-202425/Lab Session4/qwen25-worldcup-final-updated"
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float32,    #  float32 compute, no AMP (same as SFT stage)
+    bnb_4bit_use_double_quant=True,
+)
+
+tokenizer = AutoTokenizer.from_pretrained(SFT_ADAPTER_PATH, trust_remote_code=True)
+tokenizer.pad_token        = tokenizer.eos_token
+tokenizer.padding_side     = "right"
+tokenizer.model_max_length = 512
+
+base_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True,
+)
+base_model.config.use_cache = False
+
+# Attach the SFT LoRA adapter, kept trainable for DPO
+model = PeftModel.from_pretrained(base_model, SFT_ADAPTER_PATH, is_trainable=True)
+model.print_trainable_parameters()
+
+print("Parameter dtypes:", set(p.dtype for p in model.parameters()))
+
+# Sanity check: how many optimizer steps will we actually get?
+per_device_bs = 1
+grad_accum = 4   # match whatever you set below in DPOConfig
+epochs = 2
+
+total_steps = (len(dpo_train) // (per_device_bs * grad_accum)) * epochs
+print("Training examples:", len(dpo_train))
+print("Expected optimizer steps:", total_steps)
+
+
+from trl import DPOTrainer, DPOConfig
+
+DPO_OUTPUT_DIR = "/content/drive/MyDrive/CSC4182-202425/Lab Session4/qwen25-worldcup-dpo"
+
+dpo_config = DPOConfig(
+    output_dir=DPO_OUTPUT_DIR,
+    beta=0.1,
+    num_train_epochs=2,
+    per_device_train_batch_size=1,
+    per_device_eval_batch_size=1,
+    gradient_accumulation_steps=4,
+    optim="paged_adamw_32bit",
+    save_steps=10,
+    logging_steps=2,
+    learning_rate=5e-6,
+    weight_decay=0.001,
+    fp16=False,
+    bf16=False,
+    max_grad_norm=0.3,
+    warmup_steps=5,
+    lr_scheduler_type="cosine",
+    eval_strategy="steps",
+    eval_steps=10,
+    load_best_model_at_end=True,
+    report_to="none",
+)
+
+dpo_trainer = DPOTrainer(
+    model=model,
+    ref_model=None,
+    args=dpo_config,
+    train_dataset=dpo_train,
+    eval_dataset=dpo_val,
+    processing_class=tokenizer,
+)
+
+dpo_trainer.train()
+
+
+DPO_SAVE_PATH = "/content/drive/MyDrive/CSC4182-202425/Lab Session4/qwen25-worldcup-dpo-final"
+dpo_trainer.model.save_pretrained(DPO_SAVE_PATH)
+tokenizer.save_pretrained(DPO_SAVE_PATH)
+print("DPO-aligned model saved to:", DPO_SAVE_PATH)
+
+
+import matplotlib.pyplot as plt
+
+log_history = dpo_trainer.state.log_history
+train_steps  = [x["step"] for x in log_history if "loss" in x and "eval_loss" not in x]
+train_losses = [x["loss"] for x in log_history if "loss" in x and "eval_loss" not in x]
+val_steps    = [x["step"] for x in log_history if "eval_loss" in x]
+val_losses   = [x["eval_loss"] for x in log_history if "eval_loss" in x]
+
+reward_steps = [x["step"] for x in log_history if "rewards/margins" in x]
+margins      = [x["rewards/margins"] for x in log_history if "rewards/margins" in x]
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+axes[0].plot(train_steps, train_losses, label="Train Loss", color="steelblue", linewidth=2)
+axes[0].plot(val_steps, val_losses, label="Validation Loss", color="coral", linewidth=2, linestyle="--")
+axes[0].set_xlabel("Step"); axes[0].set_ylabel("DPO Loss"); axes[0].set_title("DPO Loss")
+axes[0].legend(); axes[0].grid(alpha=0.3)
+
+if margins:
+    axes[1].plot(reward_steps, margins, label="Reward Margin (chosen - rejected)", color="seagreen", linewidth=2)
+    axes[1].axhline(0, color="gray", linestyle=":")
+    axes[1].set_xlabel("Step"); axes[1].set_ylabel("Margin"); axes[1].set_title("Reward Margin (higher = better separation)")
+    axes[1].legend(); axes[1].grid(alpha=0.3)
+else:
+    axes[1].text(0.5, 0.5, "No reward margin logged", ha="center")
+
+plt.tight_layout()
+plt.savefig("/content/drive/MyDrive/CSC4182-202425/Lab Session4/dpo_training_plot.png", dpi=150)
+plt.show()
+print("Plot saved!")
+
+
+model.eval()
+
+test_questions = [
+    "Who won the 1970 FIFA World Cup?",
+    "Which country has won the most FIFA World Cups?",
+    "Who was the runner-up at the 2014 FIFA World Cup?",
+]
+
+def generate(q, use_adapter=True):
+    prompt = (
+        f"<|system|>You are a FIFA World Cup expert assistant.</s>\n"
+        f"<|user|>{q}</s>\n"
+        f"<|assistant|>"
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    ctx = model.disable_adapter() if not use_adapter else torch.no_grad()
+    with torch.no_grad():
+        if not use_adapter:
+            with model.disable_adapter():
+                outputs = model.generate(**inputs, max_new_tokens=80, temperature=0.3, do_sample=True, pad_token_id=tokenizer.eos_token_id)
+        else:
+            outputs = model.generate(**inputs, max_new_tokens=80, temperature=0.3, do_sample=True, pad_token_id=tokenizer.eos_token_id)
+    return tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+for question in test_questions:
+    print(f"\nQ: {question}")
+    print(f"A (DPO-aligned): {generate(question, use_adapter=True)}")
+
+model.eval()
+
+test_questions = [
+    "Who won the 1970 FIFA World Cup?",
+    "Which country has won the most FIFA World Cups?",
+    "Who was the runner-up at the 2014 FIFA World Cup?",
+    "Who won the 1998 FIFA World Cup?",
+    "Which country hosted the 2002 FIFA World Cup?",
+    "How many times has Brazil won the FIFA World Cup?",
+    "Who was the runner-up at the 1990 FIFA World Cup?",
+    "Which country hosted the first FIFA World Cup?",
+    "Who won the FIFA World Cup in 2006?",
+    "Which European country has won the most World Cups?",
+]
+
+def generate(q, use_adapter=True):
+    prompt = (
+        f"<|system|>You are a FIFA World Cup expert assistant.</s>\n"
+        f"<|user|>{q}</s>\n"
+        f"<|assistant|>"
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        if not use_adapter:
+            with model.disable_adapter():
+                outputs = model.generate(**inputs, max_new_tokens=80, temperature=0.3, do_sample=True, pad_token_id=tokenizer.eos_token_id)
+        else:
+            outputs = model.generate(**inputs, max_new_tokens=80, temperature=0.3, do_sample=True, pad_token_id=tokenizer.eos_token_id)
+    return tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+for question in test_questions:
+    print(f"\nQ: {question}")
+    print(f"A (SFT only):    {generate(question, use_adapter=False)}")
+    print(f"A (DPO-aligned): {generate(question, use_adapter=True)}")
